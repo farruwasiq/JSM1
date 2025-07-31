@@ -1,0 +1,145 @@
+name: JSM MW # This is your static workflow's display name
+
+run-name: ${{ github.workflow }} - ${{ github.event.inputs.action_type }} # Correct: Dynamic run name
+
+on:
+  workflow_dispatch:
+    inputs:
+      action_type:
+        description: 'Choose action: start or end'
+        required: true
+        type: choice
+        options:
+          - start
+          - end
+
+jobs:
+  start-workflow:
+    # This job runs only if the 'action_type' input is 'start'
+    if: github.event.inputs.action_type == 'start'
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # Needed for actions/upload-artifact to write to the repository's artifact storage
+
+    steps:
+      - name: Generate and Save Run Details
+        id: generate_details # Assign an ID to this step to reference its outputs
+        run: |
+          RUN_ID="${{ github.run_id }}"
+          RUN_DESCRIPTION="Workflow started at $(date)"
+
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "run_description=${RUN_DESCRIPTION}" >> "$GITHUB_OUTPUT"
+
+          echo "Run ID: ${RUN_ID}" > run_details.txt
+          echo "Description: ${RUN_DESCRIPTION}" >> run_details.txt
+          echo "Artifact created for run ID: ${RUN_ID}"
+
+      - name: Upload Run Details Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-details-start-${{ steps.generate_details.outputs.run_id }}
+          path: run_details.txt
+          retention-days: 1 # Set your desired retention period
+
+  end-workflow:
+    # This job runs only if the 'action_type' input is 'end'
+    if: github.event.inputs.action_type == 'end'
+    runs-on: ubuntu-latest
+
+    permissions:
+      actions: read # Needed for gh CLI to list workflow runs and download artifacts
+      contents: read # Also needed for actions/download-artifact if you switch back
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup GitHub CLI
+        run: |
+          # Manual installation of GitHub CLI (since it's not always the latest version pre-installed)
+          echo "Installing GitHub CLI..."
+          type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+          && sudo apt update \
+          && sudo apt install gh -y
+          gh --version
+
+      - name: Authenticate GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Authenticating GitHub CLI..."
+          gh auth setup-git
+
+      - name: Find Latest Successful 'start' Run
+        id: find_run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail # Exit immediately if any command in the pipe fails
+
+          # Get the workflow ID for "JSM MW"
+          WORKFLOW_ID=$(gh api repos/${{ github.repository }}/actions/workflows --jq '.workflows[] | select(.name=="JSM MW") | .id')
+
+          if [ -z "$WORKFLOW_ID" ]; then
+            echo "::error::Workflow 'JSM MW' not found. Exiting."
+            exit 1
+          fi
+
+          # Fetch workflow runs for this ID, extracting individual objects for local jq filtering
+          LATEST_START_RUN_ID=$(gh api /repos/${{ github.repository }}/actions/workflows/$WORKFLOW_ID/runs \
+            --jq '.workflow_runs[]' --paginate | \
+            jq -r 'select(
+              (.display_title | contains("JSM MW - start")) and
+              (.event == "workflow_dispatch") and
+              (.status == "completed") and
+              (.conclusion == "success")
+            ) | .id | tostring' | head -n 1)
+
+          if [ -z "$LATEST_START_RUN_ID" ]; then
+            echo "::error::No successful 'start' runs found with the expected criteria (displayTitle: 'JSM MW - start', event: 'workflow_dispatch', status: 'completed', conclusion: 'success')."
+            echo "Please ensure a 'start' workflow has run successfully with these characteristics, and its run name includes 'JSM MW - start'."
+            exit 1
+          fi
+
+          echo "Found latest successful 'start' run ID: $LATEST_START_RUN_ID"
+          echo "run_id_to_download=$LATEST_START_RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for Artifact Availability (Optional)
+        run: |
+          # Keep this small delay just in case the artifact service needs a moment.
+          echo "Waiting for 5 seconds to ensure artifact availability..."
+          sleep 5
+
+      - name: Download Previous Run Details Artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eo pipefail # Ensure script exits on error
+
+          RUN_ID="${{ steps.find_run.outputs.run_id_to_download }}"
+          ARTIFACT_NAME="run-details-start-${RUN_ID}"
+          DOWNLOAD_PATH="downloaded_artifacts"
+
+          echo "Attempting to download artifact '$ARTIFACT_NAME' from run ID '$RUN_ID' using gh CLI..."
+
+          mkdir -p "$DOWNLOAD_PATH"
+
+          (
+            cd "$DOWNLOAD_PATH"
+            gh run download "$RUN_ID" --name "$ARTIFACT_NAME" || {
+              echo "::error::Failed to download artifact '$ARTIFACT_NAME' from run ID '$RUN_ID' using gh CLI."
+              exit 1
+            }
+          )
+          echo "Artifact '$ARTIFACT_NAME' downloaded successfully to '$DOWNLOAD_PATH'!"
+
+      - name: Display Previous Run Details
+        run: |
+          echo "--- Details of Previous Run (ID: ${{ steps.find_run.outputs.run_id_to_download }}) ---"
+          cat downloaded_artifacts/run_details.txt
+          echo "----------------------------------------------------"
